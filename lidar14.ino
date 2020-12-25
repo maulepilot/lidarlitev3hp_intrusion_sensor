@@ -1,11 +1,19 @@
-/*This IoT sketch is for a LIDAR Lite v3HP sensor instrusion alarm with an Arduino MKR WIFI 1010 microcontroller. The LIDAR 
- * sensor emits a narrow beam of infrared light with a range of up to 40 meters each time the loop is executed. The returned 
- * reflection is converted to the distance in centimeters when a new reading is available over I2C interface.The sketch
+/*This IoT sketch is for a LIDAR Lite v3HP sensor instrusion alarm with an Arduino MKR WIFI 1010 microcontroller with MKR SD 
+ * PROTO SHIELD. The purpose of the PROTO SHIELD is to house the 680 uF capacitor and two 4.7K pullup resistors needed for 
+ * stable I2C serial communications with the LIDAR sensor. The PROTO SHIELD also contains an SD memory card which is used to
+ * log readings for analysis.
+ * 
+ * The LIDAR sensor emits a narrow beam of infrared light with a range of up to 40 meters each time the loop is 
+ * executed. The returned reflection is converted to the distance in centimeters when a new reading is available over I2C interface.The sketch
  * compares the new distance to the previous distance and generates a notification through www.pushsafer.com to an iPhone XS
  * with the Pushsafer iOS app installed and signed into the Pushsafer website. The microcontroller must be registered on the
  * website account and the access key must be stored in the arduino_secrets.h include file along with the wifi network SSID
  * and password.
-*/
+ * 
+ * A pan/tilt unit with two servos is used for scanning the LIDAR sensor; however, false alarms tend to be generated due
+ * to movement of the sensor. The sketch is designed to activate or deactivate the servos for use as a stationary beam-
+ * interrupter or a scanning sensor.
+ */
 #include <stdint.h>
 #include <Wire.h>
 #include <LIDARLite_v3HP.h>
@@ -14,6 +22,7 @@
 #include <RTCZero.h>
 #include <Servo.h>
 #include <Pushsafer.h>
+#include <SD.h>
 #include "arduino_secrets.h"
 
 // Wifi network login credentials
@@ -24,11 +33,11 @@ char password[] = SECRET_PASS; // wifi network key from arduino_secrets.h
 char PushsaferKey[] = SECRET_KEY; // pushsafer private key from arduin_secrets.h
 
 //Object declarations
-WiFiClient client;
+WiFiClient client; // The wifi client object is used for pushsafer notification
 Pushsafer pushsafer(PushsaferKey, client); // Pushsafer object to send event
 RTCZero rtc; // Real time clock object on Arduino MKR board
 LIDARLite_v3HP myLidarLite; // LIDAR sensor object
-Servo panservo,tiltservo; // Servo objects
+Servo panservo,tiltservo; // Servo objects used for pan/tilt servos when activated
 
 #define FAST_I2C // Operate the LIDAR Lite v3HP in fast serial communications mode
 
@@ -39,28 +48,28 @@ String dtstg = String(__DATE__); // Compiler date for setting RTC
 String tmstg = String(__TIME__); // Compiler time for setting RTC
 uint16_t distance,d1,d2; // LIDAR sensor distance
 long t; // Time variable to prevent multiple alarm reporting on each beam interruption
-int panservopin = 9; // servo attach pin when used
-int servodelay = 100; // servo positioning delay when used
-int pulsedelay = 1; // delay between lidar pulses
+int panservopin = 9; // pan servo attach pin when used
+int tiltservopin = 10; // tilt servo attach pin when used
+int servodelay = 15; // servo positioning delay in milliseconds when used
 int alarmdelay = 6000; // delay after alarm to prevent multiple alarms
 int panpos; // pan servo position when used
 int tiltpos; // tilt servo position when used
-int panservoX1 = 0,panservoX2 = 45; // pan servo start and end positions when used
-int tiltservoY1 = 45,tiltservoY2 = 55; // tilt servo start and end positions when used
-int redledpin = 3; // visual two-color led indicates alarm when serial monitor unavailable
-int greenledpin = 2; // visual two-color led indicates alarm when serial monitor unavailable
+int panservoX1 = 0,panservoX2 = 90; // pan servo start and end positions when used
+int tiltservoY1 = 150,tiltservoY2 = 170; // tilt servo start and end positions when used
 bool push=false; // flag to prevent push notifications during testing
-
+const int chipSelect = 4; // SD card select pin
+String lineout; // SD card write line buffer
+File logfile; // SD card file handle
+String fn = "LOGGER00.CSV"; // SD file name
 
 // Executes once on startup
 void setup()
 {
   Serial.begin(115200); // Start serial communications
+  while (!Serial);
   Wire.begin(); // Wait for serial port to initialize
   panservo.attach(panservopin); // Initialize the pan servo object
-
-  pinMode(redledpin, OUTPUT); // visual alarm pin
-  pinMode(greenledpin, OUTPUT); // visual alarm pin
+  pinMode(chipSelect, OUTPUT);
   
   // Attempt to connect to Wifi network:
   Serial.print("Connecting Wifi: ");
@@ -102,8 +111,38 @@ void setup()
   Serial.println(rtc.getSeconds());
 
   myLidarLite.configure(3); // Configure the LIDAR sensor for maximum range
-  delay(50); // Wait for lidar to stabilize
-  //Serial.println("Sweep\tPos\tRef\tDist\tDiff"); // headings for serial output if desired
+  delay(100); // Wait for lidar to stabilize
+  panservo.write(panservoX1); // position the pan servo at the initial position
+
+  // Initialize the SD card and create a log file
+  if (!SD.begin(chipSelect)) {
+    Serial.println("Card failed, or not present");
+    // don't do anything more:
+    return;
+    }
+    Serial.println("card initialized.");
+
+    SD.remove("LOGGER00.CSV");
+    // create a new file
+    char filename[] = "LOGGER00.CSV";
+    for (uint8_t i = 0; i < 100; i++) {
+      filename[6] = i/10 + '0';
+      filename[7] = i%10 + '0';
+      if (! SD.exists(filename)) {
+        // only open a new file if it doesn't exist
+        logfile = SD.open(filename, FILE_WRITE); 
+        break;  // leave the loop!
+      }
+    }
+    
+    if (! logfile) {
+      error("couldnt create file");
+    }
+    
+    Serial.print("Logging to: ");
+    Serial.println(filename);
+
+  t = millis(); // take a time stamp before starting the main loop for later use in closing the log file
 }
 
 // Main loop executes continuously
@@ -111,26 +150,33 @@ void loop()
 {
   uint8_t  newDistance = 0; // Flag set by distanceSingle function to signal new data
   
-  newDistance = distanceSingle(&distance); // take the first distance measurement
-  if (newDistance) // if the measurement is new, then store it in d1
+  for (panpos = panservoX1;panpos <= panservoX2;panpos++)
   {
-    d1 = distance;
-  }
-  delay(pulsedelay); // wait before taking the second distance measurement
-  
-  newDistance = distanceSingle(&distance); // take the second distance measurement
-  if (newDistance) // if the measurement is new, then store it in d2
-  {
-    d2 = distance;
+    panservo.write(panpos);
+    delay(servodelay);
+    newDistance = distanceSingle(&distance);
+    if (newDistance)
+    {
+      printValues();
+    }
   }
 
-   // if the absolute difference between d1 and d2 > threshld and the last alarm was more than 2 seconds
-   // ago, generate an alarm.
-  if (abs(d1 - d2) > threshld & millis() - t > 2000)
-  {    
-    PrintValues();
-    delay(alarmdelay);
-    t = millis(); 
+  for (panpos = panservoX2;panpos >= panservoX1;panpos--)
+  {
+    panservo.write(panpos);
+    delay(servodelay);
+    newDistance = distanceSingle(&distance);
+    if (newDistance)
+    {
+      printValues();
+    }
+  }
+
+  /* Every 10 milliseconds flush the file buffer and write it to the SD card so that no data is lost when power
+     is removed.*/
+  if ((millis() - t) > 10)
+  {
+    logfile.flush();
   }
 }
 
@@ -157,41 +203,9 @@ uint8_t distanceSingle(uint16_t * distance)
     return 1; // Return a boolean value that indicates there is new data to be read
 }
 
-//---------------------------------------------------------------------
-// Read Continuous Distance Measurements
-//
-// The most recent distance measurement can always be read from
-// device registers. Polling for the BUSY flag in the STATUS
-// register can alert the user that the distance measurement is new
-// and that the next measurement can be initiated. If the device is
-// BUSY this function does nothing and returns 0. If the device is
-// NOT BUSY this function triggers the next measurement, reads the
-// distance data from the previous measurement, and returns 1.
-//---------------------------------------------------------------------
-uint8_t distanceContinuous(uint16_t * distance)
-{
-    uint8_t newDistance = 0;
-
-    // Check on busyFlag to indicate if device is idle
-    // (meaning = it finished the previously triggered measurement)
-    if (myLidarLite.getBusyFlag() == 0)
-    {
-        // Trigger the next range measurement
-        myLidarLite.takeRange();
-
-        // Read new distance data from device registers
-        *distance = myLidarLite.readDistance();
-
-        // Report to calling function that we have new data
-        newDistance = 1;
-    }
-
-    return newDistance;
-}
-
 // Display a timestamp from the RTC and distance on the serial monitor and generate a
 // Pushsafer notification when an alarm is triggered
-void PrintValues()
+void printValues()
 {
   String yy,mm,dd,hr,mn,se; // String variables to hold the elements of the RTC timestamp
   yy = String(rtc.getYear()); // Get the timestamp year from the RTC
@@ -253,18 +267,18 @@ void PrintValues()
   if (push) Serial.print(pushsafer.sendEvent(input));
 
   // Displays the alarm timestamp and distance in feet
-  Serial.print("MOVEMENT at ");
-  Serial.print(timestr);
-  Serial.print(" d1(ft): ");
-  Serial.print(d1*cmtofeet);
-  Serial.print(" d2(ft): ");
-  Serial.println(d2*cmtofeet);
-
-  // Flash red-green led for seconds passed in parameter
-  RedGreenLED(3);
+  lineout = String("\"")+timestr+String("\",")+String(distance);
+  logfile.println(lineout);
+  Serial.println(lineout);
+  //Serial.print(" pos: ");
+  //Serial.print(panpos);
+  //Serial.print(" distance: ");
+  //Serial.println(distance);
 }
 
-// Sets the MKR WIFI 1010 RTC to the sketch compile time
+/* Sets the MKR WIFI 1010 real time clock (RTC) to the sketch compile time. The RTC will keep time if a battery
+ *  is connected to the 1010 but the RTC must be set if no battery is connected.
+ */
 void rtcSet()
 {
   String months = "JanFebMarAprMayJunJulAugSepOctNovDec"; // Month identifier array
@@ -294,20 +308,11 @@ void rtcSet()
   rtc.setTime(hhnbr,mnnbr,ssnbr);
 }
 
-// function flashes the red-green alarm led for the number of seconds in the parameter
-void RedGreenLED(int t)
+/* This function displays an error on the serial monitor if the SD card cannot be initialized.*/
+void error(char *str)
 {
-  for (int i = 0;i <= t;i++)
-  {
-    // alternately flash red and green leds
-    analogWrite(redledpin, 0);
-    analogWrite(greenledpin, 255);
-    delay(500);
-    analogWrite(redledpin, 255);
-    analogWrite(greenledpin, 0);
-    delay(500);    
-  }
-  // turn both leds off
-  analogWrite(redledpin, 0);
-  analogWrite(greenledpin, 0);
+  Serial.print("error: ");
+  Serial.println(str);
+  
+  while(1);
 }
